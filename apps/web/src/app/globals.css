@@ -1,0 +1,19 @@
+@import "@shield/design-system/tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-surface-canvas text-ink-primary antialiased;
+    font-family: var(--font-sans);
+  }
+  :focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+  }
+}

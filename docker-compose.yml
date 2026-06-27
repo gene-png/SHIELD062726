@@ -1,0 +1,219 @@
+name: shield062626
+
+x-api-env: &api-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://shield:shield@db:5432/shield}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+  S3_BUCKET: ${S3_BUCKET:-shield-artifacts}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-shield-minio}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-shield-minio-secret}
+  S3_KMS_KEY_ID: ${S3_KMS_KEY_ID:-dev-stub-key}
+  KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://keycloak:8080/realms/shield}
+  KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-shield-api}
+  KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-shield-web}
+  SHIELD_LLM_PROVIDER: ${SHIELD_LLM_PROVIDER:-anthropic}
+  SHIELD_LLM_MODEL: ${SHIELD_LLM_MODEL:-claude-opus-4-7}
+  SHIELD_LLM_MODE: ${SHIELD_LLM_MODE:-fixture}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  SHIELD_BOOTSTRAP_ADMIN_EMAIL: ${SHIELD_BOOTSTRAP_ADMIN_EMAIL:-}
+  SHIELD_BOOTSTRAP_ADMIN_PASSWORD: ${SHIELD_BOOTSTRAP_ADMIN_PASSWORD:-}
+  SHIELD_BOOTSTRAP_ADMIN_NAME: ${SHIELD_BOOTSTRAP_ADMIN_NAME:-SHIELD Admin}
+  SHIELD_USER_PURGE_IDLE_DAYS: ${SHIELD_USER_PURGE_IDLE_DAYS:-365}
+  SHIELD_AUTH_REQUIRE_MFA: ${SHIELD_AUTH_REQUIRE_MFA:-false}
+  SHIELD_AUTH_REQUIRE_EMAIL_VERIFY: ${SHIELD_AUTH_REQUIRE_EMAIL_VERIFY:-false}
+  SHIELD_EMAIL_DELIVERY_ENABLED: ${SHIELD_EMAIL_DELIVERY_ENABLED:-false}
+  SHIELD_REDACTION_MODE: ${SHIELD_REDACTION_MODE:-strict}
+  JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+  JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-1800}
+  SHIELD_ACCOUNT_LOCKOUT_MAX_ATTEMPTS: ${SHIELD_ACCOUNT_LOCKOUT_MAX_ATTEMPTS:-10}
+  SHIELD_ACCOUNT_LOCKOUT_WINDOW_SECONDS: ${SHIELD_ACCOUNT_LOCKOUT_WINDOW_SECONDS:-900}
+  SHIELD_IDLE_TIMEOUT_SECONDS: ${SHIELD_IDLE_TIMEOUT_SECONDS:-1800}
+  SHIELD_FORCED_REAUTH_SECONDS: ${SHIELD_FORCED_REAUTH_SECONDS:-86400}
+  SMTP_HOST: ${SMTP_HOST:-mailhog}
+  SMTP_PORT: ${SMTP_PORT:-1025}
+  SMTP_FROM: ${SMTP_FROM:-no-reply@shield.local}
+
+services:
+  db:
+    restart: unless-stopped
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shield
+      POSTGRES_PASSWORD: shield
+      POSTGRES_DB: shield
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shield"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  redis:
+    restart: unless-stopped
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "6379:6379"
+
+  minio:
+    restart: unless-stopped
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-shield-minio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-shield-minio-secret}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # One-shot: create the artifacts bucket. MinIO does not auto-create buckets
+  # and S3Storage assumes it already exists, so without this the first upload
+  # fails with NoSuchBucket -> 500. Idempotent (--ignore-existing); exits 0.
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-shield-minio}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-shield-minio-secret}
+      S3_BUCKET: ${S3_BUCKET:-shield-artifacts}
+    entrypoint:
+      - sh
+      - -c
+      - >
+        mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY" &&
+        mc mb --ignore-existing "local/$$S3_BUCKET" &&
+        echo "bucket $$S3_BUCKET ready"
+
+  keycloak:
+    restart: unless-stopped
+    image: quay.io/keycloak/keycloak:25.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+      - keycloak-data:/opt/keycloak/data
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # KC 25 serves /health on the management port (9000), not 8080. Use HTTP/1.0
+      # so the server closes the connection and `cat` returns instead of blocking
+      # on keep-alive until the probe times out.
+      test:
+        [
+          "CMD-SHELL",
+          "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  mailhog:
+    restart: unless-stopped
+    image: mailhog/mailhog:latest
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  api:
+    restart: unless-stopped
+    build:
+      context: ./apps/api
+    environment:
+      <<: *api-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+    # Apply pending migrations before serving so a newly-added revision can't
+    # leave the persistent db volume behind the (hot-reloaded) model code.
+    # Dev convenience only - in prod, migrations run as a discrete deploy step,
+    # not in the app container, to avoid replicas racing each other.
+    command:
+      - sh
+      - -c
+      - >
+        alembic upgrade head &&
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # NOTE (Work Order F): AI runs are SYNCHRONOUS. The run-ai endpoints invoke the
+  # LLM inline via app.ai.engine.run_job, so there is no Celery worker / queue.
+  # `redis` remains available for future rate-limiting or async work but has no
+  # consumer today. See DECISIONS.md.
+
+  web:
+    restart: unless-stopped
+    image: node:20-bookworm
+    working_dir: /app
+    environment:
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-dev-only-replace}
+      API_BASE_URL: http://api:8000
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://keycloak:8080/realms/shield}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-shield-web}
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/web:/app/apps/web
+      - ./packages:/app/packages
+      - ./package.json:/app/package.json
+      - ./pnpm-workspace.yaml:/app/pnpm-workspace.yaml
+      # pnpm hoists the real packages into the workspace-root node_modules/.pnpm
+      # store; both this and the per-app dir must persist or symlinks dangle on
+      # recreate.
+      - node-modules-root:/app/node_modules
+      - node-modules-web:/app/apps/web/node_modules
+    # First boot installs deps into the volumes; later boots skip the install
+    # (the next binary is already present) and start the dev server directly.
+    command:
+      - sh
+      - -c
+      - >
+        corepack enable >/dev/null 2>&1;
+        corepack prepare pnpm@9.12.0 --activate >/dev/null 2>&1;
+        cd /app;
+        [ -f apps/web/node_modules/next/dist/bin/next ] || pnpm install;
+        exec pnpm -F web dev
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  keycloak-data:
+  node-modules-root:
+  node-modules-web:
